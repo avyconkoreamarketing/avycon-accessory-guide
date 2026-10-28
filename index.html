@@ -1755,6 +1755,7 @@ class Component extends DCLogic {
     this._loadCameraImages();
     this._loadHistory();
     this._loadSharedProfiles();
+    this._loadSharedLibrary();   // templates / combo data / accessory DB / images / roster — shared, auto-synced
     try { const un = localStorage.getItem('avycon_username'); if (un != null) this.setState({ userName: un }); } catch (e) {}
     try { const cd = localStorage.getItem('avycon_combodata'); if (cd) { let m = JSON.parse(cd); if (m && m.cases) m = { [(m.camera || 'default')]: m }; if (m && typeof m === 'object') this.setState({ comboByModel: m }); } } catch (e) {}
     try { const tp = localStorage.getItem('avycon_templates'); if (tp) { const m = JSON.parse(tp); if (m && typeof m === 'object') this.setState({ templates: m }); } } catch (e) {}
@@ -1831,7 +1832,7 @@ class Component extends DCLogic {
   };
 
   _persistNames = (m) => { try { localStorage.setItem('avycon_acc_names', JSON.stringify(m)); } catch (e) {} };
-  _persistImgs = (m) => { try { localStorage.setItem('avycon_img_by_name', JSON.stringify(m)); } catch (e) {} };
+  _persistImgs = (m) => { try { localStorage.setItem('avycon_img_by_name', JSON.stringify(m)); } catch (e) {} this._scheduleLibrarySync && this._scheduleLibrarySync(); };
 
   // i18n accessor (language is stored in settings.lang)
   _t = () => { const lang = (this.state.settings || {}).lang || 'en'; return this.T[lang] || this.T.en; };
@@ -2008,7 +2009,7 @@ class Component extends DCLogic {
   toggleAddMenu = (loc) => this.setState(s => ({ addMenuLoc: s.addMenuLoc === loc ? null : loc }));
 
   // --- Accessory product database ---
-  _persistDb = (db) => { try { localStorage.setItem('avycon_product_db', JSON.stringify(db)); } catch (e) {} };
+  _persistDb = (db) => { try { localStorage.setItem('avycon_product_db', JSON.stringify(db)); } catch (e) {} this._scheduleLibrarySync && this._scheduleLibrarySync(); };
   // toggles: pressing Accessory DB again returns to the view it was opened from
   gotoDb = () => this.setState(s => (s.view === 'db'
     ? { view: s.dbReturnView || 'table', sysMenuOpen: false }
@@ -2202,7 +2203,7 @@ class Component extends DCLogic {
   };
 
   // ---- Product roster (setup screen) ----
-  _persistRoster = (roster) => { try { localStorage.setItem('avycon_roster', JSON.stringify(roster)); } catch (e) {} };
+  _persistRoster = (roster) => { try { localStorage.setItem('avycon_roster', JSON.stringify(roster)); } catch (e) {} this._scheduleLibrarySync && this._scheduleLibrarySync(); };
   // extra spellings accepted in imported CSVs (normalized: lowercase, no spaces/_/-)
   CAT_ALIASES = {
     MNT_WALL: ['wall','mntwall','wallmount','mountwall','벽면','벽면마운트','월마운트','pared'],
@@ -2302,8 +2303,8 @@ class Component extends DCLogic {
     }, () => { this._pushSharedProfiles(); });
   };
   // ---- Templates: save the combination structure, apply to any camera ----
-  _persistTemplates = (t) => { try { localStorage.setItem('avycon_templates', JSON.stringify(t || {})); } catch (e) {} };
-  _persistUsedTpl = (m) => { try { localStorage.setItem('avycon_used_tpl', JSON.stringify(m || {})); } catch (e) {} };
+  _persistTemplates = (t) => { try { localStorage.setItem('avycon_templates', JSON.stringify(t || {})); } catch (e) {} this._scheduleLibrarySync && this._scheduleLibrarySync(); };
+  _persistUsedTpl = (m) => { try { localStorage.setItem('avycon_used_tpl', JSON.stringify(m || {})); } catch (e) {} this._scheduleLibrarySync && this._scheduleLibrarySync(); };
   // Record which template a product was built from (shown in the work list). A product built from its
   // own Excel references itself.
   _setUsedTemplate = (model, tplName) => {
@@ -2376,7 +2377,7 @@ class Component extends DCLogic {
   // The Excel is a fixed template: one row per combination case (WL-01, CL-02, ...), with an ordered
   // accessory list (Acc1..5 category+model), a count, and remarks. Hidden/reference columns
   // (위치(KO)/케이스명/케이스설명/배치/이미지_카메라/이미지_Acc1) are ignored — we pick only the display columns by header.
-  _persistCombo = (m) => { try { localStorage.setItem('avycon_combodata', JSON.stringify(m || {})); } catch (e) {} };
+  _persistCombo = (m) => { try { localStorage.setItem('avycon_combodata', JSON.stringify(m || {})); } catch (e) {} this._scheduleLibrarySync && this._scheduleLibrarySync(); };
   _curModel = () => (((this.state.settings || {}).cameraModel) || '').trim();
   // Convert the Excel combination cases into the guide layout: one combo per case (no forced
   // "Direct install" base), keeping the Excel case IDs and accessory order. Locations with no case are disabled.
@@ -2944,6 +2945,63 @@ class Component extends DCLogic {
         .then((d) => { const merged = this._mergeProfiles((d && d.profiles) || {}, mine); this._persistProfiles(merged); this.setState({ profiles: merged }); post(merged); })
         .catch(() => post(mine));
     } catch (e) { post(mine); }
+  };
+  // ---- Shared CATALOG library (templates / combination data / accessory DB / image map / roster) ----
+  // These used to live only in localStorage (per-browser). Now they sync through Vercel Blob like saved
+  // guides do: merge the remote library in on load, push local changes up (read-modify-write) so every
+  // browser and device stays on the latest automatically — no manual export/import.
+  _LIB_DICTS = ['templates', 'usedTemplateByModel', 'comboByModel', 'imgByName', 'roster'];
+  _libFromState = (s) => ({
+    templates: s.templates || {}, usedTemplateByModel: s.usedTemplateByModel || {},
+    comboByModel: s.comboByModel || {}, imgByName: s.imgByName || {},
+    productDb: s.productDb || {}, roster: s.roster || {},
+  });
+  // Merge two library objects; `over` wins on key conflicts. productDb arrays are unioned (additive).
+  _mergeLibData = (base, over) => {
+    base = base || {}; over = over || {};
+    const out = {};
+    this._LIB_DICTS.forEach((k) => { out[k] = { ...(base[k] || {}), ...(over[k] || {}) }; });
+    const pdb = {}; const cats = new Set([...Object.keys(base.productDb || {}), ...Object.keys(over.productDb || {})]);
+    cats.forEach((c) => { pdb[c] = Array.from(new Set([ ...((base.productDb || {})[c] || []), ...((over.productDb || {})[c] || []) ])); });
+    out.productDb = pdb;
+    return out;
+  };
+  // Persist each slice locally (without echoing back into a sync) and return the state patch.
+  _applyLib = (lib) => {
+    this._applyingLib = true;
+    try {
+      this._persistTemplates(lib.templates); this._persistUsedTpl(lib.usedTemplateByModel);
+      this._persistCombo(lib.comboByModel); this._persistImgs(lib.imgByName);
+      this._persistDb(lib.productDb); this._persistRoster(lib.roster);
+    } finally { this._applyingLib = false; }
+    return { templates: lib.templates, usedTemplateByModel: lib.usedTemplateByModel, comboByModel: lib.comboByModel, imgByName: lib.imgByName, productDb: lib.productDb, roster: lib.roster };
+  };
+  _loadSharedLibrary = () => {
+    try {
+      fetch('/api/library', { cache: 'no-store' })
+        .then((r) => r.ok ? r.json() : null)
+        .then((remote) => {
+          this.setState((s) => this._applyLib(this._mergeLibData(this._libFromState(s), remote || {})),
+            () => { this._pushSharedLibrary(); });   // bootstrap: upload any local-only catalog data
+        })
+        .catch(() => {});
+    } catch (e) {}
+  };
+  _pushSharedLibrary = () => {
+    const mine = this._libFromState(this.state);
+    const post = (lib) => { try { fetch('/api/library', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(lib) }).catch(() => {}); } catch (e) {} };
+    try {
+      fetch('/api/library', { cache: 'no-store' })
+        .then((r) => r.ok ? r.json() : null)
+        .then((remote) => { const merged = this._mergeLibData(remote || {}, mine); const patch = this._applyLib(merged); this.setState(patch); post(merged); })
+        .catch(() => post(mine));
+    } catch (e) { post(mine); }
+  };
+  // Debounced: any local catalog change schedules an upload (skipped while applying server data).
+  _scheduleLibrarySync = () => {
+    if (this._applyingLib) return;
+    if (this._libSyncT) clearTimeout(this._libSyncT);
+    this._libSyncT = setTimeout(() => { this._libSyncT = null; this._pushSharedLibrary(); }, 1500);
   };
   setUserName = (e) => { const v = e.target.value; this.setState({ userName: v }); try { localStorage.setItem('avycon_username', v || ''); } catch (err) {} };
   setWorkQuery = (e) => this.setState({ workQuery: e.target.value, workPage: 0 });
